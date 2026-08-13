@@ -1,0 +1,44 @@
+name: "get_drive_time"
+display_name: "Drive Time"
+description: "Get driving time and distance to any destination with real-time traffic. Includes a background agent that monitors your calendar and alerts you when it's time to leave."
+version: "0.1.0"
+min_jarvis_version: "0.9.0"
+license: "MIT"
+author:
+  github: "alexberardi"
+categories: ["travel", "productivity"]
+platforms: ["darwin", "linux"]
+keywords: ["drive", "driving", "commute", "directions", "distance", "travel", "traffic", "route", "departure", "leave"]
+
+packages:
+  - name: httpx
+
+secrets:
+  - key: GOOGLE_MAPS_API_KEY
+    scope: integration
+    value_type: string
+    description: "Google Maps API key (Directions + Geocoding enabled)"
+    is_sensitive: true
+    required: true
+  - key: HOME_ADDRESS
+    scope: integration
+    value_type: string
+    description: "Your home address (default origin for drive time calculations)"
+    is_sensitive: false
+    required: true
+  - key: DRIVE_TIME_BUFFER_MINUTES
+    scope: integration
+    value_type: string
+    description: "Minutes of buffer to add before departure time (default: 10)"
+    is_sensitive: false
+    required: false
+
+components:
+  - type: command
+    name: get_drive_time
+    path: commands/get_drive_time/command.py
+    description: "Get driving time and distance to a destination"
+  - type: agent
+    name: drive_time_alerts
+    path: agents/drive_time_alerts/agent.py
+    description: "Monitors calendar events with locations and alerts when it's time to leave"

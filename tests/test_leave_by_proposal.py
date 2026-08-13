@@ -54,3 +54,25 @@ def test_dedup_proposes_once_per_event():
         _call(agent, departure, 40)
         _call(agent, departure, 40)
     assert Inbox.return_value.propose_action.call_count == 1
+
+
+# ── home_context origin resolution (drops the HOME_ADDRESS secret dependency) ──
+def test_agent_resolve_home_address_prefers_home_context():
+    from jarvis_command_sdk import set_home_context
+    agent = DriveTimeAlertAgent()
+    set_home_context({"location": "Springfield, IL 62704"})
+    try:
+        with patch("agents.drive_time_alerts.agent._storage") as st:
+            st.get_secret.return_value = "123 Secret St"   # secret present but home_context wins
+            assert agent._resolve_home_address() == "Springfield, IL 62704"
+    finally:
+        set_home_context(None)
+
+
+def test_agent_resolve_home_address_falls_back_to_secret():
+    from jarvis_command_sdk import set_home_context
+    set_home_context(None)
+    agent = DriveTimeAlertAgent()
+    with patch("agents.drive_time_alerts.agent._storage") as st:
+        st.get_secret.return_value = "123 Secret St"
+        assert agent._resolve_home_address() == "123 Secret St"

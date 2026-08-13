@@ -126,9 +126,10 @@ class DriveTimeAlertAgent(IJarvisAgent):
     async def run(self) -> None:
         """Fetch calendar events, compute drive times, inject context, generate alerts."""
         try:
-            # Load secrets
+            # Load secrets + resolve the origin (household home_context location,
+            # injected by command-center, with the HOME_ADDRESS secret as fallback).
             api_key = _storage.get_secret("GOOGLE_MAPS_API_KEY")
-            home_address = _storage.get_secret("HOME_ADDRESS")
+            home_address = self._resolve_home_address()
             if not api_key or not home_address:
                 logger.debug("Drive time agent skipping — missing API key or home address")
                 return
@@ -415,6 +416,28 @@ class DriveTimeAlertAgent(IJarvisAgent):
             expires_at=now + ttl,
             priority=priority,
         ))
+
+    # ── Origin resolution ───────────────────────────────────────────
+
+    def _resolve_home_address(self) -> str | None:
+        """The drive-time origin: the household's CC-injected home_context location
+        (preferred — set once at the household level, no per-agent secret) with the
+        HOME_ADDRESS secret as fallback. get_home_context() is seeded by the agent
+        scheduler; Config.get_dict is the fallback when the ContextVar didn't
+        propagate (older SDK / spawned thread)."""
+        hc = None
+        try:
+            from jarvis_command_sdk import get_home_context
+            hc = get_home_context()
+        except Exception:  # noqa: BLE001 — older SDK without home_context
+            hc = None
+        if not hc:
+            try:
+                from utils.config_service import Config
+                hc = Config.get_dict("home_context")
+            except Exception:  # noqa: BLE001 — not in a node runtime
+                hc = None
+        return (hc or {}).get("location") or _storage.get_secret("HOME_ADDRESS")
 
     # ── Leave-by proposal ───────────────────────────────────────────
 

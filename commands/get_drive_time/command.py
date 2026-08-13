@@ -210,9 +210,12 @@ class GetDriveTimeCommand(IJarvisCommand):
                 context_data={"message": "Where would you like to drive to?"},
             )
 
-        # Resolve origin — use explicit origin or fall back to home address
+        # Resolve origin — explicit origin > household home_context location
+        # (injected by command-center, set once at the household level) > the
+        # per-command HOME_ADDRESS secret (kept as a fallback; deprecate, don't delete).
         if not origin:
-            origin = _storage.get_secret("HOME_ADDRESS")
+            hc = getattr(request_info, "home_context", None) or {}
+            origin = hc.get("location") or _storage.get_secret("HOME_ADDRESS")
 
         if not origin:
             return CommandResponse.error_response(

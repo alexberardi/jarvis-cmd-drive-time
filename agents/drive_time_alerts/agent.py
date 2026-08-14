@@ -19,7 +19,6 @@ Requires:
 
 from __future__ import annotations
 
-import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
@@ -49,18 +48,18 @@ from jarvis_command_sdk import (
     Alert,
     IJarvisAgent,
     IJarvisSecret,
-    JarvisInbox,
     JarvisSecret,
     JarvisStorage,
     RequestInformation,
     set_current_user_id,
 )
 
-# Only PROPOSE a leave-by reminder card once the departure is within this lead
-# window — enough time to act on it, but not a flood of cards for every located
-# event on the whole day's calendar at once.
-MAX_LEAVE_BY_LEAD_MINUTES = 120
-
+from drive_time_shared.location_resolver import (
+    is_generic_location,
+    locality_of,
+    looks_like_full_address,
+    resolve_destination,
+)
 from drive_time_shared.routing_service import RouteResult, RoutingService
 
 logger = JarvisLogger(service="jarvis-node")
@@ -71,67 +70,12 @@ DEFAULT_BUFFER_MINUTES = 10  # extra minutes before departure
 
 _storage = JarvisStorage("drive_time_alerts")
 
-# A COMPLETE street address (street number + street type, then within a short
-# city/suite gap a locality anchor — an UPPERCASE state abbreviation or a ZIP) is
-# handed to Google Directions verbatim. Requiring the anchor keeps vague strings
-# that merely contain a number ("Gate 12345", "Room 5 Dr Patel") off the direct
-# path. The state check is case-SENSITIVE so a stray 2-letter word ("Dr Ed")
-# isn't read as a state; the street-type list is case-insensitive.
-_STREET_TYPES = (
-    r"(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|Dr|Drive|Ln|Lane|Way|"
-    r"Hwy|Highway|Ct|Court|Pl|Place|Pkwy|Parkway|Cir|Circle|Ter|Terrace|Sq|Square)"
-)
-_FULL_ADDR_RE = re.compile(
-    r"\b\d{1,6}\s+"
-    r"(?i:(?:[A-Za-z0-9.'\-]+\s+){0,4}" + _STREET_TYPES + r")\b"
-    r".{0,40}?"
-    r"(?:\b[A-Z]{2}\b(?:\s+\d{5}(?:-\d{4})?)?|\b\d{5}(?:-\d{4})?\b)"
-)
-
-
-def _looks_like_full_address(location: str) -> bool:
-    return bool(_FULL_ADDR_RE.search(location or ""))
-
-
-# Generic place-TYPES (common nouns) mean "MY dentist / MY gym", which no
-# geocoder can pin without knowing which one — the "there could be fifteen
-# Dentists, don't route any" rule. Skipped outright rather than geocoded to
-# whichever Google returns first. Brand/proper names ("Starbucks", "ShopRite of
-# Brick") are NOT here — the area-biased geocode of a named place is a fine answer.
-_GENERIC_TERMS = {
-    "dentist", "dentists", "doctor", "doctors", "dr", "physician", "pediatrician",
-    "orthodontist", "dermatologist", "clinic", "hospital", "pharmacy", "drugstore",
-    "gym", "office", "work", "the office", "school", "college", "university",
-    "daycare", "restaurant", "cafe", "coffee", "coffee shop", "bar", "pub", "diner",
-    "store", "shop", "mall", "market", "supermarket", "grocery", "grocery store",
-    "bank", "atm", "gas", "gas station", "post office", "library", "park", "church",
-    "temple", "mosque", "synagogue", "salon", "barber", "barbershop", "spa", "vet",
-    "veterinarian", "hairdresser", "airport", "station", "hotel", "motel", "home",
-    "house", "appointment", "meeting", "lunch", "dinner", "breakfast", "the doctor",
-    "the dentist", "the gym", "the bank", "the store", "the pharmacy", "the vet",
-}
-
-
-def _is_generic_location(location: str) -> bool:
-    """True when the location is a bare common-noun place type (optionally with a
-    leading article / trailing possessive) — no geocoder can pin it to the user's
-    specific place, so it's skipped. Proper/brand names fall through and geocode."""
-    q = re.sub(r"[^\w\s]", "", (location or "").strip().lower())
-    q = re.sub(r"^(?:the|a|an)\s+", "", q).strip()
-    return q in _GENERIC_TERMS or ("the " + q) in _GENERIC_TERMS
-
-
-def _locality_of(location: str) -> str:
-    """City/state/ZIP portion of the household location, for geocode bias. The
-    household location may be a full STREET address (it doubles as the drive-time
-    origin), so strip a leading "<number> <street> <type>," segment; a plain
-    locality passes through unchanged."""
-    if not location:
-        return ""
-    parts = [p.strip() for p in location.split(",") if p.strip()]
-    if len(parts) >= 2 and re.match(r"\d{1,6}\s+\S+", parts[0]):
-        return ", ".join(parts[1:])
-    return location
+# Destination resolution moved to drive_time_shared.location_resolver so the
+# get_drive_time command's strict path applies the SAME guard. These aliases keep
+# the agent's historical private names importable (tests import them from here).
+_looks_like_full_address = looks_like_full_address
+_is_generic_location = is_generic_location
+_locality_of = locality_of
 
 
 class DriveTimeAlertAgent(IJarvisAgent):
@@ -140,7 +84,6 @@ class DriveTimeAlertAgent(IJarvisAgent):
     def __init__(self) -> None:
         self._alerts: List[Alert] = []
         self._alerted_event_keys: set[str] = set()
-        self._proposed_event_keys: set[str] = set()
         self._context_data: Dict[str, Any] = {}
 
     # ── Agent metadata ──────────────────────────────────────────────
@@ -367,10 +310,6 @@ class DriveTimeAlertAgent(IJarvisAgent):
         if not route:
             return None
 
-        # Prefer Directions' own geocoded address for display — cleaner than the
-        # biased query string, and shows the user exactly where we'd route.
-        display_location = route.destination_address or location
-
         # Calculate departure time
         drive_minutes = route.best_duration_minutes
         departure_time = event_start - timedelta(minutes=drive_minutes + buffer_minutes)
@@ -387,13 +326,9 @@ class DriveTimeAlertAgent(IJarvisAgent):
             leave_by_display, start_display, now,
         )
 
-        # Propose a tap-to-confirm card to set a persistent "leave by" reminder —
-        # the user opts in (and can "Never suggest this") rather than us auto-creating
-        # a reminder every time an appointment approaches.
-        self._maybe_propose_leave_by(
-            title, event_id, departure_time, minutes_until_departure,
-            drive_minutes, display_location, start_display, leave_by_display, today,
-        )
+        # The tap-to-confirm "leave by" reminder card is now proposed server-side by
+        # the CC signal bridge (calendar appt.upcoming → get_drive_time →
+        # reminder.set_at), not here — the poller's direct propose was retired.
 
         # Build memory for injection
         content = (
@@ -558,82 +493,31 @@ class DriveTimeAlertAgent(IJarvisAgent):
                 hc = None
         return (hc or {}).get("location") or _storage.get_secret("HOME_ADDRESS")
 
-    # ── Destination resolution ──────────────────────────────────────
-
-    def _resolve_destination(self, location: str, home_address: str) -> str | None:
-        """The destination string handed to Google Directions for this event.
-
-        - A COMPLETE street address is used verbatim (Directions geocodes it).
-        - A bare place TYPE ("Dentist", "the office") is SKIPPED — no geocoder can
-          tell which specific one the user means (the "fifteen Dentists" rule).
-        - Any other named place ("Jersey Shore Medical Center") is biased with the
-          household locality ("<name>, <city ST ZIP>") so Directions geocodes the
-          nearby one, not a same-named place elsewhere. Directions returns one best
-          match, or no route — in which case the event is skipped upstream."""
-        if _looks_like_full_address(location):
-            return location
-        if _is_generic_location(location):
-            logger.info(
-                "Generic event location — skipping (can't pin one specific place)",
-                location=location,
-            )
-            return None
-        locality = _locality_of(home_address or "")
-        return f"{location}, {locality}" if locality else location
-
-    # ── Leave-by proposal ───────────────────────────────────────────
-
     def _resolve_calendar_user_id(self) -> int | None:
-        """Best-effort: which household member's calendar this is, to target the
-        card. The reminder is ultimately owned by whoever CONFIRMS the card (their
-        callback user_id), so None (a household card) is a safe fallback."""
+        """Which household member's calendar this agent reads. The calendar command
+        refuses without a user_id (OAuth token lookup), so this is required for the
+        fetch — it survives the retirement of the leave-by card, which used it too."""
         try:
             from get_calendar_events_shared.user_resolution import find_configured_user_ids
             uids = find_configured_user_ids()
             return uids[0] if uids else None
-        except Exception:  # noqa: BLE001 — resolution optional; fall back to household
+        except Exception:  # noqa: BLE001 — resolution optional; fall back to no user
             return None
 
-    def _maybe_propose_leave_by(
-        self, title: str, event_id: str, departure_time: datetime,
-        minutes_until_departure: float, drive_minutes: int, location: str,
-        start_display: str, leave_by_display: str, today: str,
-    ) -> None:
-        """Propose a 'set a reminder to leave on time?' card — once per event, and
-        only within the lead window (so we don't card every located event on the day
-        at once, and the departure is still in the future when proposed)."""
-        if not (0 < minutes_until_departure <= MAX_LEAVE_BY_LEAD_MINUTES):
-            return
-        key = f"{today}:{event_id}"
-        if key in self._proposed_event_keys:
-            return
+    # ── Destination resolution ──────────────────────────────────────
 
-        idempotency_key = f"leaveby:{key}"
-        try:
-            JarvisInbox("drive_time_alerts").propose_action(
-                target_command="reminder",
-                action="set_at",
-                params={
-                    "text": f"Leave for {title}",
-                    "due_at_iso": departure_time.isoformat(),
-                    "idempotency_key": idempotency_key,
-                },
-                idempotency_key=idempotency_key,
-                editable=["text"],
-                field_types={"due_at_iso": "datetime"},
-                title="Set a reminder to leave on time?",
-                summary=f"{title} at {start_display} — leave by {leave_by_display} ({drive_minutes} min drive)",
-                body=(f"{title} starts at {start_display} at {location}. It's about "
-                      f"{drive_minutes} min from home, so leave by {leave_by_display}."),
-                # Deterministic key + semantic descriptor power "Never suggest this".
-                source=f"leaveby:{event_id}",
-                descriptor=f'leave-by reminders for calendar events like "{title}"',
-                user_id=self._resolve_calendar_user_id(),
+    def _resolve_destination(self, location: str, home_address: str) -> str | None:
+        """Directions-raw destination for this event — see
+        drive_time_shared.location_resolver.resolve_destination. Full address
+        verbatim; generic type skipped (None); else biased with the household
+        locality. Directions returns one best match or no route (skipped upstream)."""
+        dest = resolve_destination(location, home_address)
+        if dest is None:
+            logger.info(
+                "Generic event location — skipping (can't pin one specific place)",
+                location=location,
             )
-            self._proposed_event_keys.add(key)
-            logger.info("Proposed leave-by reminder", title=title, leave_by=leave_by_display)
-        except Exception as e:  # noqa: BLE001 — a failed proposal must not break the run
-            logger.warning("Leave-by proposal failed", error=str(e))
+        return dest
 
     # ── Memory injection ────────────────────────────────────────────
 

@@ -37,6 +37,7 @@ from jarvis_command_sdk import (
     RequestInformation,
 )
 
+from drive_time_shared.location_resolver import resolve_destination
 from drive_time_shared.routing_service import RoutingService
 
 logger = JarvisLogger(service="jarvis-node")
@@ -225,6 +226,25 @@ class GetDriveTimeCommand(IJarvisCommand):
                     )
                 },
             )
+
+        # STRICT resolution: the CC leave-by bridge passes resolution="strict" (an
+        # UNDECLARED kwarg the voice path never sets) so the Directions-raw guard is
+        # applied to a calendar location — a generic type ("Dentist") is skipped
+        # rather than routed to an arbitrary nearby one. Runs before the API-key
+        # check because a generic location needs no key to be declined. Voice queries
+        # keep their lenient passthrough (e.g. "the mall" still area-biased-geocodes).
+        if kwargs.get("resolution") == "strict":
+            resolved = resolve_destination(destination, origin)
+            if resolved is None:
+                return CommandResponse.error_response(
+                    f"'{destination}' is too generic to route to a specific place.",
+                    context_data={
+                        "skipped": True,
+                        "reason": "generic_location",
+                        "message": f"I couldn't tell which {destination} you mean.",
+                    },
+                )
+            destination = resolved
 
         api_key = _storage.get_secret("GOOGLE_MAPS_API_KEY")
         if not api_key:

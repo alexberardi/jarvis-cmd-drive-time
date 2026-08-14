@@ -12,15 +12,15 @@ from agents.drive_time_alerts.agent import (
     _looks_like_full_address,
 )
 
-_HOME = "33 National Ave, Brick NJ 08724"
+_HOME = "100 Test St, Testville CA 90000"
 
 
 # ── _looks_like_full_address ─────────────────────────────────────────
 @pytest.mark.parametrize("loc", [
     "742 Evergreen Terrace, Springfield, IL 62704",
     "500 Market St, Newark, NJ 07102",
-    "33 National Ave, Brick NJ 08724",
-    "123 Main St, Brick, NJ 08724",
+    "100 Test St, Testville CA 90000",
+    "123 Main St, Testville, CA 90000",
 ])
 def test_complete_address_detected(loc):
     assert _looks_like_full_address(loc)
@@ -47,7 +47,7 @@ def test_generic_place_type_detected(loc):
 
 
 @pytest.mark.parametrize("loc", [
-    "Starbucks", "ShopRite of Brick", "Jersey Shore Medical Center",
+    "Starbucks", "ShopRite of Testville", "Community Hospital",
     "Dr. Patel's Dental", "Springfield Airport Diner",
 ])
 def test_proper_or_brand_name_not_generic(loc):
@@ -56,8 +56,8 @@ def test_proper_or_brand_name_not_generic(loc):
 
 # ── _locality_of ─────────────────────────────────────────────────────
 def test_locality_strips_leading_street_address():
-    assert _locality_of("33 National Ave, Brick NJ 08724") == "Brick NJ 08724"
-    assert _locality_of("Brick, NJ") == "Brick, NJ"
+    assert _locality_of("100 Test St, Testville CA 90000") == "Testville CA 90000"
+    assert _locality_of("Testville, CA") == "Testville, CA"
     assert _locality_of("Springfield, IL 62704") == "Springfield, IL 62704"
     assert _locality_of("") == ""
 
@@ -77,14 +77,14 @@ def test_generic_location_skipped():
 
 def test_named_place_biased_with_household_locality():
     agent = DriveTimeAlertAgent()
-    dest = agent._resolve_destination("Jersey Shore Medical Center", _HOME)
-    assert dest == "Jersey Shore Medical Center, Brick NJ 08724"
+    dest = agent._resolve_destination("Community Hospital", _HOME)
+    assert dest == "Community Hospital, Testville CA 90000"
 
 
 def test_named_place_without_locality_passes_through():
     agent = DriveTimeAlertAgent()
-    assert (agent._resolve_destination("Jersey Shore Medical Center", "")
-            == "Jersey Shore Medical Center")
+    assert (agent._resolve_destination("Community Hospital", "")
+            == "Community Hospital")
 
 
 # ── HOME_ADDRESS is no longer a required secret (origin = household.location) ──
@@ -114,3 +114,33 @@ def test_parse_event_start_invalid_returns_none():
     agent = DriveTimeAlertAgent()
     assert agent._parse_event_start("not a time") is None
     assert agent._parse_event_start(None) is None
+
+
+# ── origin resolution: home_context (household.location) > HOME_ADDRESS secret ──
+def test_resolve_home_address_prefers_home_context(monkeypatch):
+    import jarvis_command_sdk
+
+    import agents.drive_time_alerts.agent as agent_mod
+
+    monkeypatch.setattr(
+        jarvis_command_sdk, "get_home_context",
+        lambda: {"location": "Testville, CA 90000"}, raising=False,
+    )
+    monkeypatch.setattr(
+        agent_mod._storage, "get_secret",
+        lambda k, *a, **kw: "999 Secret Rd" if k == "HOME_ADDRESS" else None,
+    )
+    assert agent_mod.DriveTimeAlertAgent()._resolve_home_address() == "Testville, CA 90000"
+
+
+def test_resolve_home_address_falls_back_to_secret(monkeypatch):
+    import jarvis_command_sdk
+
+    import agents.drive_time_alerts.agent as agent_mod
+
+    monkeypatch.setattr(jarvis_command_sdk, "get_home_context", lambda: None, raising=False)
+    monkeypatch.setattr(
+        agent_mod._storage, "get_secret",
+        lambda k, *a, **kw: "999 Secret Rd" if k == "HOME_ADDRESS" else None,
+    )
+    assert agent_mod.DriveTimeAlertAgent()._resolve_home_address() == "999 Secret Rd"

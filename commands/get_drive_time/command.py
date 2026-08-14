@@ -80,17 +80,14 @@ class GetDriveTimeCommand(IJarvisCommand):
 
     @property
     def required_secrets(self) -> List[IJarvisSecret]:
+        # Origin comes from the household's `household.location` setting (injected
+        # as home_context) — no per-command home-address secret. The GOOGLE_MAPS
+        # key is the only thing to configure. (A legacy HOME_ADDRESS secret, if one
+        # was set previously, is still honored at runtime as a fallback.)
         return [
             JarvisSecret(
                 "GOOGLE_MAPS_API_KEY",
                 "Google Maps API key with Directions API enabled",
-                "integration",
-                "string",
-                required=True,
-            ),
-            JarvisSecret(
-                "HOME_ADDRESS",
-                "Your home address (default origin for drive time)",
                 "integration",
                 "string",
                 required=True,
@@ -115,8 +112,9 @@ class GetDriveTimeCommand(IJarvisCommand):
             "## Setup\n\n"
             "1. Go to [Google Cloud Console](https://console.cloud.google.com/)\n"
             "2. Enable the **Directions API**\n"
-            "3. Create an API key and paste it here\n"
-            "4. Set your home address as the default origin"
+            "3. Create an API key and paste it here\n\n"
+            "Your home address comes from your household location "
+            "(Settings → Household), so there's nothing else to set here."
         )
 
     def generate_prompt_examples(self) -> List[CommandExample]:

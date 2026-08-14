@@ -12,12 +12,14 @@ the user asks "what does my afternoon look like?"
 
 Requires:
 - Google Maps API key (GOOGLE_MAPS_API_KEY)
-- Home address (HOME_ADDRESS)
+- Household location set (Settings → Household) — the drive-time origin, injected
+  as home_context (a legacy HOME_ADDRESS secret is still honored as a fallback)
 - Calendar package installed (optional — agent is a no-op without it)
 """
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
@@ -51,6 +53,7 @@ from jarvis_command_sdk import (
     JarvisSecret,
     JarvisStorage,
     RequestInformation,
+    set_current_user_id,
 )
 
 # Only PROPOSE a leave-by reminder card once the departure is within this lead
@@ -67,6 +70,68 @@ CACHE_TTL_MINUTES = 30  # re-fetch drive time after this
 DEFAULT_BUFFER_MINUTES = 10  # extra minutes before departure
 
 _storage = JarvisStorage("drive_time_alerts")
+
+# A COMPLETE street address (street number + street type, then within a short
+# city/suite gap a locality anchor — an UPPERCASE state abbreviation or a ZIP) is
+# handed to Google Directions verbatim. Requiring the anchor keeps vague strings
+# that merely contain a number ("Gate 12345", "Room 5 Dr Patel") off the direct
+# path. The state check is case-SENSITIVE so a stray 2-letter word ("Dr Ed")
+# isn't read as a state; the street-type list is case-insensitive.
+_STREET_TYPES = (
+    r"(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|Dr|Drive|Ln|Lane|Way|"
+    r"Hwy|Highway|Ct|Court|Pl|Place|Pkwy|Parkway|Cir|Circle|Ter|Terrace|Sq|Square)"
+)
+_FULL_ADDR_RE = re.compile(
+    r"\b\d{1,6}\s+"
+    r"(?i:(?:[A-Za-z0-9.'\-]+\s+){0,4}" + _STREET_TYPES + r")\b"
+    r".{0,40}?"
+    r"(?:\b[A-Z]{2}\b(?:\s+\d{5}(?:-\d{4})?)?|\b\d{5}(?:-\d{4})?\b)"
+)
+
+
+def _looks_like_full_address(location: str) -> bool:
+    return bool(_FULL_ADDR_RE.search(location or ""))
+
+
+# Generic place-TYPES (common nouns) mean "MY dentist / MY gym", which no
+# geocoder can pin without knowing which one — the "there could be fifteen
+# Dentists, don't route any" rule. Skipped outright rather than geocoded to
+# whichever Google returns first. Brand/proper names ("Starbucks", "ShopRite of
+# Brick") are NOT here — the area-biased geocode of a named place is a fine answer.
+_GENERIC_TERMS = {
+    "dentist", "dentists", "doctor", "doctors", "dr", "physician", "pediatrician",
+    "orthodontist", "dermatologist", "clinic", "hospital", "pharmacy", "drugstore",
+    "gym", "office", "work", "the office", "school", "college", "university",
+    "daycare", "restaurant", "cafe", "coffee", "coffee shop", "bar", "pub", "diner",
+    "store", "shop", "mall", "market", "supermarket", "grocery", "grocery store",
+    "bank", "atm", "gas", "gas station", "post office", "library", "park", "church",
+    "temple", "mosque", "synagogue", "salon", "barber", "barbershop", "spa", "vet",
+    "veterinarian", "hairdresser", "airport", "station", "hotel", "motel", "home",
+    "house", "appointment", "meeting", "lunch", "dinner", "breakfast", "the doctor",
+    "the dentist", "the gym", "the bank", "the store", "the pharmacy", "the vet",
+}
+
+
+def _is_generic_location(location: str) -> bool:
+    """True when the location is a bare common-noun place type (optionally with a
+    leading article / trailing possessive) — no geocoder can pin it to the user's
+    specific place, so it's skipped. Proper/brand names fall through and geocode."""
+    q = re.sub(r"[^\w\s]", "", (location or "").strip().lower())
+    q = re.sub(r"^(?:the|a|an)\s+", "", q).strip()
+    return q in _GENERIC_TERMS or ("the " + q) in _GENERIC_TERMS
+
+
+def _locality_of(location: str) -> str:
+    """City/state/ZIP portion of the household location, for geocode bias. The
+    household location may be a full STREET address (it doubles as the drive-time
+    origin), so strip a leading "<number> <street> <type>," segment; a plain
+    locality passes through unchanged."""
+    if not location:
+        return ""
+    parts = [p.strip() for p in location.split(",") if p.strip()]
+    if len(parts) >= 2 and re.match(r"\d{1,6}\s+\S+", parts[0]):
+        return ", ".join(parts[1:])
+    return location
 
 
 class DriveTimeAlertAgent(IJarvisAgent):
@@ -100,17 +165,13 @@ class DriveTimeAlertAgent(IJarvisAgent):
 
     @property
     def required_secrets(self) -> List[IJarvisSecret]:
+        # Origin is the household's `household.location` (injected as home_context),
+        # not a per-agent home-address secret. Only the Maps key is configured here.
+        # A legacy HOME_ADDRESS secret, if set, is still honored at runtime.
         return [
             JarvisSecret(
                 "GOOGLE_MAPS_API_KEY",
                 "Google Maps API key with Directions API enabled",
-                "integration",
-                "string",
-                required=True,
-            ),
-            JarvisSecret(
-                "HOME_ADDRESS",
-                "Your home address (origin for drive time calculations)",
                 "integration",
                 "string",
                 required=True,
@@ -191,18 +252,67 @@ class DriveTimeAlertAgent(IJarvisAgent):
             )
             return []
 
+        # The calendar command needs to know WHOSE calendar to read. Pass the
+        # configured calendar user both on the request and via the ContextVar
+        # (the command uses get_current_user_id() for its OAuth token lookup) —
+        # without it, it refuses with "no speaker_user_id".
+        user_id = self._resolve_calendar_user_id()
+        if user_id is None:
+            logger.info("Drive time agent: no calendar user configured — no events")
+            return []
+        set_current_user_id(user_id)
+
         cmd = ReadCalendarCommand()
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = datetime.now().strftime("%Y-%m-%d")  # command wants an ISO date, not "today"
         request_info = RequestInformation(
             voice_command="calendar check",
             conversation_id="drive-time-agent",
+            user_id=user_id,
         )
 
         response = cmd.run(request_info, resolved_datetimes=[today])
         if not response.success or not response.context_data:
+            logger.info(
+                "Drive time agent: calendar read failed",
+                error=getattr(response, "error_details", None),
+            )
             return []
 
         return response.context_data.get("events", [])
+
+    def _local_tz(self):
+        """The node's local timezone — calendar display times are local."""
+        try:
+            from zoneinfo import ZoneInfo
+
+            from utils.timezone_util import get_user_timezone
+            return ZoneInfo(get_user_timezone())
+        except Exception:  # noqa: BLE001 — fall back to UTC if unavailable
+            return timezone.utc
+
+    def _parse_event_start(self, start_str) -> "datetime | None":
+        """Parse a calendar event start into a tz-aware UTC datetime. Accepts an
+        ISO datetime, OR a bare display time ("6:45 PM") which the calendar
+        command emits with the date implied by today, interpreted in the node's
+        local timezone."""
+        if not isinstance(start_str, str):
+            return None
+        s = start_str.strip()
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            pass
+        tz = self._local_tz()
+        for fmt in ("%I:%M %p", "%I:%M%p", "%I %p", "%H:%M"):
+            try:
+                t = datetime.strptime(s, fmt).time()
+            except ValueError:
+                continue
+            d = datetime.now(tz).date()
+            return datetime(d.year, d.month, d.day, t.hour, t.minute,
+                            tzinfo=tz).astimezone(timezone.utc)
+        return None
 
     # ── Per-event processing ────────────────────────────────────────
 
@@ -230,16 +340,10 @@ class DriveTimeAlertAgent(IJarvisAgent):
         if not start_str or is_all_day:
             return None
 
-        # Parse event start time
-        try:
-            if isinstance(start_str, str):
-                start_str = start_str.replace("Z", "+00:00")
-                event_start = datetime.fromisoformat(start_str)
-                if event_start.tzinfo is None:
-                    event_start = event_start.replace(tzinfo=timezone.utc)
-            else:
-                return None
-        except (ValueError, TypeError):
+        # Parse the event start. The calendar command returns either an ISO
+        # datetime OR a bare DISPLAY time ("6:45 PM") for today, so parse both.
+        event_start = self._parse_event_start(start_str)
+        if event_start is None:
             return None
 
         # Skip events that have already started
@@ -247,20 +351,35 @@ class DriveTimeAlertAgent(IJarvisAgent):
         if minutes_until_start < 0:
             return None
 
-        # Get drive time (cached or fresh)
+        # Resolve the destination. A full address routes directly; a generic type
+        # ("Dentist", "the office") is skipped (we don't route one of fifteen); any
+        # other named place is biased with the household locality and geocoded by
+        # Directions. A place Directions can't route (no route) is skipped below.
         event_id = event.get("id", title)
+        destination = self._resolve_destination(location, home_address)
+        if not destination:
+            return None
+
+        # Get drive time (cached or fresh)
         route = self._get_cached_or_fresh_route(
-            routing, home_address, location, event_id, today, now,
+            routing, home_address, destination, event_id, today, now,
         )
         if not route:
             return None
+
+        # Prefer Directions' own geocoded address for display — cleaner than the
+        # biased query string, and shows the user exactly where we'd route.
+        display_location = route.destination_address or location
 
         # Calculate departure time
         drive_minutes = route.best_duration_minutes
         departure_time = event_start - timedelta(minutes=drive_minutes + buffer_minutes)
         minutes_until_departure = (departure_time - now).total_seconds() / 60
-        leave_by_display = departure_time.strftime("%I:%M %p").lstrip("0")
-        start_display = event_start.strftime("%I:%M %p").lstrip("0")
+        # event_start/departure are tz-aware UTC — format the SPOKEN/card times in
+        # the node's LOCAL timezone, else "6:31 PM" would read as "10:31 PM" (UTC).
+        _tz = self._local_tz()
+        leave_by_display = departure_time.astimezone(_tz).strftime("%I:%M %p").lstrip("0")
+        start_display = event_start.astimezone(_tz).strftime("%I:%M %p").lstrip("0")
 
         # Generate departure alert if approaching leave time
         self._maybe_alert(
@@ -273,7 +392,7 @@ class DriveTimeAlertAgent(IJarvisAgent):
         # a reminder every time an appointment approaches.
         self._maybe_propose_leave_by(
             title, event_id, departure_time, minutes_until_departure,
-            drive_minutes, location, start_display, leave_by_display, today,
+            drive_minutes, display_location, start_display, leave_by_display, today,
         )
 
         # Build memory for injection
@@ -438,6 +557,29 @@ class DriveTimeAlertAgent(IJarvisAgent):
             except Exception:  # noqa: BLE001 — not in a node runtime
                 hc = None
         return (hc or {}).get("location") or _storage.get_secret("HOME_ADDRESS")
+
+    # ── Destination resolution ──────────────────────────────────────
+
+    def _resolve_destination(self, location: str, home_address: str) -> str | None:
+        """The destination string handed to Google Directions for this event.
+
+        - A COMPLETE street address is used verbatim (Directions geocodes it).
+        - A bare place TYPE ("Dentist", "the office") is SKIPPED — no geocoder can
+          tell which specific one the user means (the "fifteen Dentists" rule).
+        - Any other named place ("Jersey Shore Medical Center") is biased with the
+          household locality ("<name>, <city ST ZIP>") so Directions geocodes the
+          nearby one, not a same-named place elsewhere. Directions returns one best
+          match, or no route — in which case the event is skipped upstream."""
+        if _looks_like_full_address(location):
+            return location
+        if _is_generic_location(location):
+            logger.info(
+                "Generic event location — skipping (can't pin one specific place)",
+                location=location,
+            )
+            return None
+        locality = _locality_of(home_address or "")
+        return f"{location}, {locality}" if locality else location
 
     # ── Leave-by proposal ───────────────────────────────────────────
 

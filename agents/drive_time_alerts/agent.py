@@ -12,7 +12,8 @@ the user asks "what does my afternoon look like?"
 
 Requires:
 - Google Maps API key (GOOGLE_MAPS_API_KEY)
-- Home address (HOME_ADDRESS)
+- Household location set (Settings → Household) — the drive-time origin, injected
+  as home_context (a legacy HOME_ADDRESS secret is still honored as a fallback)
 - Calendar package installed (optional — agent is a no-op without it)
 """
 
@@ -47,17 +48,18 @@ from jarvis_command_sdk import (
     Alert,
     IJarvisAgent,
     IJarvisSecret,
-    JarvisInbox,
     JarvisSecret,
     JarvisStorage,
     RequestInformation,
+    set_current_user_id,
 )
 
-# Only PROPOSE a leave-by reminder card once the departure is within this lead
-# window — enough time to act on it, but not a flood of cards for every located
-# event on the whole day's calendar at once.
-MAX_LEAVE_BY_LEAD_MINUTES = 120
-
+from drive_time_shared.location_resolver import (
+    is_generic_location,
+    locality_of,
+    looks_like_full_address,
+    resolve_destination,
+)
 from drive_time_shared.routing_service import RouteResult, RoutingService
 
 logger = JarvisLogger(service="jarvis-node")
@@ -68,6 +70,13 @@ DEFAULT_BUFFER_MINUTES = 10  # extra minutes before departure
 
 _storage = JarvisStorage("drive_time_alerts")
 
+# Destination resolution moved to drive_time_shared.location_resolver so the
+# get_drive_time command's strict path applies the SAME guard. These aliases keep
+# the agent's historical private names importable (tests import them from here).
+_looks_like_full_address = looks_like_full_address
+_is_generic_location = is_generic_location
+_locality_of = locality_of
+
 
 class DriveTimeAlertAgent(IJarvisAgent):
     """Background agent that monitors calendar events and generates departure alerts."""
@@ -75,7 +84,6 @@ class DriveTimeAlertAgent(IJarvisAgent):
     def __init__(self) -> None:
         self._alerts: List[Alert] = []
         self._alerted_event_keys: set[str] = set()
-        self._proposed_event_keys: set[str] = set()
         self._context_data: Dict[str, Any] = {}
 
     # ── Agent metadata ──────────────────────────────────────────────
@@ -100,17 +108,13 @@ class DriveTimeAlertAgent(IJarvisAgent):
 
     @property
     def required_secrets(self) -> List[IJarvisSecret]:
+        # Origin is the household's `household.location` (injected as home_context),
+        # not a per-agent home-address secret. Only the Maps key is configured here.
+        # A legacy HOME_ADDRESS secret, if set, is still honored at runtime.
         return [
             JarvisSecret(
                 "GOOGLE_MAPS_API_KEY",
                 "Google Maps API key with Directions API enabled",
-                "integration",
-                "string",
-                required=True,
-            ),
-            JarvisSecret(
-                "HOME_ADDRESS",
-                "Your home address (origin for drive time calculations)",
                 "integration",
                 "string",
                 required=True,
@@ -126,9 +130,10 @@ class DriveTimeAlertAgent(IJarvisAgent):
     async def run(self) -> None:
         """Fetch calendar events, compute drive times, inject context, generate alerts."""
         try:
-            # Load secrets
+            # Load secrets + resolve the origin (household home_context location,
+            # injected by command-center, with the HOME_ADDRESS secret as fallback).
             api_key = _storage.get_secret("GOOGLE_MAPS_API_KEY")
-            home_address = _storage.get_secret("HOME_ADDRESS")
+            home_address = self._resolve_home_address()
             if not api_key or not home_address:
                 logger.debug("Drive time agent skipping — missing API key or home address")
                 return
@@ -190,18 +195,67 @@ class DriveTimeAlertAgent(IJarvisAgent):
             )
             return []
 
+        # The calendar command needs to know WHOSE calendar to read. Pass the
+        # configured calendar user both on the request and via the ContextVar
+        # (the command uses get_current_user_id() for its OAuth token lookup) —
+        # without it, it refuses with "no speaker_user_id".
+        user_id = self._resolve_calendar_user_id()
+        if user_id is None:
+            logger.info("Drive time agent: no calendar user configured — no events")
+            return []
+        set_current_user_id(user_id)
+
         cmd = ReadCalendarCommand()
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = datetime.now().strftime("%Y-%m-%d")  # command wants an ISO date, not "today"
         request_info = RequestInformation(
             voice_command="calendar check",
             conversation_id="drive-time-agent",
+            user_id=user_id,
         )
 
         response = cmd.run(request_info, resolved_datetimes=[today])
         if not response.success or not response.context_data:
+            logger.info(
+                "Drive time agent: calendar read failed",
+                error=getattr(response, "error_details", None),
+            )
             return []
 
         return response.context_data.get("events", [])
+
+    def _local_tz(self):
+        """The node's local timezone — calendar display times are local."""
+        try:
+            from zoneinfo import ZoneInfo
+
+            from utils.timezone_util import get_user_timezone
+            return ZoneInfo(get_user_timezone())
+        except Exception:  # noqa: BLE001 — fall back to UTC if unavailable
+            return timezone.utc
+
+    def _parse_event_start(self, start_str) -> "datetime | None":
+        """Parse a calendar event start into a tz-aware UTC datetime. Accepts an
+        ISO datetime, OR a bare display time ("6:45 PM") which the calendar
+        command emits with the date implied by today, interpreted in the node's
+        local timezone."""
+        if not isinstance(start_str, str):
+            return None
+        s = start_str.strip()
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            pass
+        tz = self._local_tz()
+        for fmt in ("%I:%M %p", "%I:%M%p", "%I %p", "%H:%M"):
+            try:
+                t = datetime.strptime(s, fmt).time()
+            except ValueError:
+                continue
+            d = datetime.now(tz).date()
+            return datetime(d.year, d.month, d.day, t.hour, t.minute,
+                            tzinfo=tz).astimezone(timezone.utc)
+        return None
 
     # ── Per-event processing ────────────────────────────────────────
 
@@ -229,16 +283,10 @@ class DriveTimeAlertAgent(IJarvisAgent):
         if not start_str or is_all_day:
             return None
 
-        # Parse event start time
-        try:
-            if isinstance(start_str, str):
-                start_str = start_str.replace("Z", "+00:00")
-                event_start = datetime.fromisoformat(start_str)
-                if event_start.tzinfo is None:
-                    event_start = event_start.replace(tzinfo=timezone.utc)
-            else:
-                return None
-        except (ValueError, TypeError):
+        # Parse the event start. The calendar command returns either an ISO
+        # datetime OR a bare DISPLAY time ("6:45 PM") for today, so parse both.
+        event_start = self._parse_event_start(start_str)
+        if event_start is None:
             return None
 
         # Skip events that have already started
@@ -246,10 +294,18 @@ class DriveTimeAlertAgent(IJarvisAgent):
         if minutes_until_start < 0:
             return None
 
-        # Get drive time (cached or fresh)
+        # Resolve the destination. A full address routes directly; a generic type
+        # ("Dentist", "the office") is skipped (we don't route one of fifteen); any
+        # other named place is biased with the household locality and geocoded by
+        # Directions. A place Directions can't route (no route) is skipped below.
         event_id = event.get("id", title)
+        destination = self._resolve_destination(location, home_address)
+        if not destination:
+            return None
+
+        # Get drive time (cached or fresh)
         route = self._get_cached_or_fresh_route(
-            routing, home_address, location, event_id, today, now,
+            routing, home_address, destination, event_id, today, now,
         )
         if not route:
             return None
@@ -258,8 +314,11 @@ class DriveTimeAlertAgent(IJarvisAgent):
         drive_minutes = route.best_duration_minutes
         departure_time = event_start - timedelta(minutes=drive_minutes + buffer_minutes)
         minutes_until_departure = (departure_time - now).total_seconds() / 60
-        leave_by_display = departure_time.strftime("%I:%M %p").lstrip("0")
-        start_display = event_start.strftime("%I:%M %p").lstrip("0")
+        # event_start/departure are tz-aware UTC — format the SPOKEN/card times in
+        # the node's LOCAL timezone, else "6:31 PM" would read as "10:31 PM" (UTC).
+        _tz = self._local_tz()
+        leave_by_display = departure_time.astimezone(_tz).strftime("%I:%M %p").lstrip("0")
+        start_display = event_start.astimezone(_tz).strftime("%I:%M %p").lstrip("0")
 
         # Generate departure alert if approaching leave time
         self._maybe_alert(
@@ -267,13 +326,9 @@ class DriveTimeAlertAgent(IJarvisAgent):
             leave_by_display, start_display, now,
         )
 
-        # Propose a tap-to-confirm card to set a persistent "leave by" reminder —
-        # the user opts in (and can "Never suggest this") rather than us auto-creating
-        # a reminder every time an appointment approaches.
-        self._maybe_propose_leave_by(
-            title, event_id, departure_time, minutes_until_departure,
-            drive_minutes, location, start_display, leave_by_display, today,
-        )
+        # The tap-to-confirm "leave by" reminder card is now proposed server-side by
+        # the CC signal bridge (calendar appt.upcoming → get_drive_time →
+        # reminder.set_at), not here — the poller's direct propose was retired.
 
         # Build memory for injection
         content = (
@@ -416,59 +471,53 @@ class DriveTimeAlertAgent(IJarvisAgent):
             priority=priority,
         ))
 
-    # ── Leave-by proposal ───────────────────────────────────────────
+    # ── Origin resolution ───────────────────────────────────────────
+
+    def _resolve_home_address(self) -> str | None:
+        """The drive-time origin: the household's CC-injected home_context location
+        (preferred — set once at the household level, no per-agent secret) with the
+        HOME_ADDRESS secret as fallback. get_home_context() is seeded by the agent
+        scheduler; Config.get_dict is the fallback when the ContextVar didn't
+        propagate (older SDK / spawned thread)."""
+        hc = None
+        try:
+            from jarvis_command_sdk import get_home_context
+            hc = get_home_context()
+        except Exception:  # noqa: BLE001 — older SDK without home_context
+            hc = None
+        if not hc:
+            try:
+                from utils.config_service import Config
+                hc = Config.get_dict("home_context")
+            except Exception:  # noqa: BLE001 — not in a node runtime
+                hc = None
+        return (hc or {}).get("location") or _storage.get_secret("HOME_ADDRESS")
 
     def _resolve_calendar_user_id(self) -> int | None:
-        """Best-effort: which household member's calendar this is, to target the
-        card. The reminder is ultimately owned by whoever CONFIRMS the card (their
-        callback user_id), so None (a household card) is a safe fallback."""
+        """Which household member's calendar this agent reads. The calendar command
+        refuses without a user_id (OAuth token lookup), so this is required for the
+        fetch — it survives the retirement of the leave-by card, which used it too."""
         try:
             from get_calendar_events_shared.user_resolution import find_configured_user_ids
             uids = find_configured_user_ids()
             return uids[0] if uids else None
-        except Exception:  # noqa: BLE001 — resolution optional; fall back to household
+        except Exception:  # noqa: BLE001 — resolution optional; fall back to no user
             return None
 
-    def _maybe_propose_leave_by(
-        self, title: str, event_id: str, departure_time: datetime,
-        minutes_until_departure: float, drive_minutes: int, location: str,
-        start_display: str, leave_by_display: str, today: str,
-    ) -> None:
-        """Propose a 'set a reminder to leave on time?' card — once per event, and
-        only within the lead window (so we don't card every located event on the day
-        at once, and the departure is still in the future when proposed)."""
-        if not (0 < minutes_until_departure <= MAX_LEAVE_BY_LEAD_MINUTES):
-            return
-        key = f"{today}:{event_id}"
-        if key in self._proposed_event_keys:
-            return
+    # ── Destination resolution ──────────────────────────────────────
 
-        idempotency_key = f"leaveby:{key}"
-        try:
-            JarvisInbox("drive_time_alerts").propose_action(
-                target_command="reminder",
-                action="set_at",
-                params={
-                    "text": f"Leave for {title}",
-                    "due_at_iso": departure_time.isoformat(),
-                    "idempotency_key": idempotency_key,
-                },
-                idempotency_key=idempotency_key,
-                editable=["text"],
-                field_types={"due_at_iso": "datetime"},
-                title="Set a reminder to leave on time?",
-                summary=f"{title} at {start_display} — leave by {leave_by_display} ({drive_minutes} min drive)",
-                body=(f"{title} starts at {start_display} at {location}. It's about "
-                      f"{drive_minutes} min from home, so leave by {leave_by_display}."),
-                # Deterministic key + semantic descriptor power "Never suggest this".
-                source=f"leaveby:{event_id}",
-                descriptor=f'leave-by reminders for calendar events like "{title}"',
-                user_id=self._resolve_calendar_user_id(),
+    def _resolve_destination(self, location: str, home_address: str) -> str | None:
+        """Directions-raw destination for this event — see
+        drive_time_shared.location_resolver.resolve_destination. Full address
+        verbatim; generic type skipped (None); else biased with the household
+        locality. Directions returns one best match or no route (skipped upstream)."""
+        dest = resolve_destination(location, home_address)
+        if dest is None:
+            logger.info(
+                "Generic event location — skipping (can't pin one specific place)",
+                location=location,
             )
-            self._proposed_event_keys.add(key)
-            logger.info("Proposed leave-by reminder", title=title, leave_by=leave_by_display)
-        except Exception as e:  # noqa: BLE001 — a failed proposal must not break the run
-            logger.warning("Leave-by proposal failed", error=str(e))
+        return dest
 
     # ── Memory injection ────────────────────────────────────────────
 

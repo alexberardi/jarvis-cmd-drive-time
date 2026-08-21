@@ -37,6 +37,7 @@ from jarvis_command_sdk import (
     RequestInformation,
 )
 
+from drive_time_shared.location_resolver import resolve_destination
 from drive_time_shared.routing_service import RoutingService
 
 logger = JarvisLogger(service="jarvis-node")
@@ -80,17 +81,14 @@ class GetDriveTimeCommand(IJarvisCommand):
 
     @property
     def required_secrets(self) -> List[IJarvisSecret]:
+        # Origin comes from the household's `household.location` setting (injected
+        # as home_context) — no per-command home-address secret. The GOOGLE_MAPS
+        # key is the only thing to configure. (A legacy HOME_ADDRESS secret, if one
+        # was set previously, is still honored at runtime as a fallback.)
         return [
             JarvisSecret(
                 "GOOGLE_MAPS_API_KEY",
                 "Google Maps API key with Directions API enabled",
-                "integration",
-                "string",
-                required=True,
-            ),
-            JarvisSecret(
-                "HOME_ADDRESS",
-                "Your home address (default origin for drive time)",
                 "integration",
                 "string",
                 required=True,
@@ -115,8 +113,9 @@ class GetDriveTimeCommand(IJarvisCommand):
             "## Setup\n\n"
             "1. Go to [Google Cloud Console](https://console.cloud.google.com/)\n"
             "2. Enable the **Directions API**\n"
-            "3. Create an API key and paste it here\n"
-            "4. Set your home address as the default origin"
+            "3. Create an API key and paste it here\n\n"
+            "Your home address comes from your household location "
+            "(Settings → Household), so there's nothing else to set here."
         )
 
     def generate_prompt_examples(self) -> List[CommandExample]:
@@ -210,9 +209,12 @@ class GetDriveTimeCommand(IJarvisCommand):
                 context_data={"message": "Where would you like to drive to?"},
             )
 
-        # Resolve origin — use explicit origin or fall back to home address
+        # Resolve origin — explicit origin > household home_context location
+        # (injected by command-center, set once at the household level) > the
+        # per-command HOME_ADDRESS secret (kept as a fallback; deprecate, don't delete).
         if not origin:
-            origin = _storage.get_secret("HOME_ADDRESS")
+            hc = getattr(request_info, "home_context", None) or {}
+            origin = hc.get("location") or _storage.get_secret("HOME_ADDRESS")
 
         if not origin:
             return CommandResponse.error_response(
@@ -224,6 +226,25 @@ class GetDriveTimeCommand(IJarvisCommand):
                     )
                 },
             )
+
+        # STRICT resolution: the CC leave-by bridge passes resolution="strict" (an
+        # UNDECLARED kwarg the voice path never sets) so the Directions-raw guard is
+        # applied to a calendar location — a generic type ("Dentist") is skipped
+        # rather than routed to an arbitrary nearby one. Runs before the API-key
+        # check because a generic location needs no key to be declined. Voice queries
+        # keep their lenient passthrough (e.g. "the mall" still area-biased-geocodes).
+        if kwargs.get("resolution") == "strict":
+            resolved = resolve_destination(destination, origin)
+            if resolved is None:
+                return CommandResponse.error_response(
+                    f"'{destination}' is too generic to route to a specific place.",
+                    context_data={
+                        "skipped": True,
+                        "reason": "generic_location",
+                        "message": f"I couldn't tell which {destination} you mean.",
+                    },
+                )
+            destination = resolved
 
         api_key = _storage.get_secret("GOOGLE_MAPS_API_KEY")
         if not api_key:

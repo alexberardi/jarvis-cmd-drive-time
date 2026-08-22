@@ -3,7 +3,7 @@ display_name: "Drive Time"
 description: "Get driving time and distance to any destination with real-time traffic. Includes a background agent that monitors your calendar and alerts you when it's time to leave."
 version: "0.1.0"
 min_jarvis_version: "0.9.0"
-license: "MIT"
+license: Apache-2.0
 author:
   github: "alexberardi"
 categories: ["travel", "productivity"]
